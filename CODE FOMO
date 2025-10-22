@@ -1,0 +1,359 @@
+bộ code PyTorch hoàn chỉnh để hiện thực hoá thuật toán FOMO (backbone CNN + FOMO head → heatmap → centroid). Code bao gồm:
+
+Dataset & tiền xử lý (tạo heatmap mục tiêu từ tọa độ tâm).
+
+Mô hình FOMO (backbone nhẹ + conv1x1 head).
+
+Hàm loss (BCEWithLogits trên heatmap).
+
+Vòng huấn luyện và validation cơ bản.
+
+Hàm inference: sinh heatmap dự đoán và trích tọa độ centroid (local maxima + NMS đơn giản).
+
+Hướng dẫn cài đặt & chạy.
+
+Bạn có thể dùng mã này làm khung để huấn luyện trên bộ dữ liệu thực tế (ảnh + danh sách centroid).
+
+
+
+
+Yêu Cầu:
+python >= 3.8
+pip install torch torchvision numpy opencv-python tqdm matplotlib
+
+
+fomo_train_infer.py
+"""
+fomo_train_infer.py
+Một triển khai đơn giản của mô hình FOMO bằng PyTorch.
+
+Gồm:
+- Dataset tạo heatmap từ centroid labels
+- Mô hình: Backbone nhỏ + Conv1x1 Head -> heatmap logits
+- Loss: BCEWithLogitsLoss giữa heatmap dự đoán và heatmap thật
+- Training loop cơ bản + inference tìm centroid
+"""
+
+import os
+import math
+import json
+from glob import glob
+from typing import List, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+
+# -----------------------
+# CẤU HÌNH CHUNG
+# -----------------------
+INPUT_SIZE = (96, 96)        # kích thước đầu vào cho mô hình
+HEATMAP_SIZE = (24, 24)      # kích thước heatmap (ảnh/stride). Tùy chỉnh
+NUM_CLASSES = 3              # số lớp: ví dụ 0=background, 1=person, 2=motorbike
+GAUSSIAN_SIGMA = 1.2         # sigma để sinh heatmap mềm
+BATCH_SIZE = 16
+LR = 1e-3
+EPOCHS = 30
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_SAVE = "fomo_model.pth"
+
+# -----------------------
+# HÀM SINH HEATMAP (ground truth)
+# -----------------------
+def draw_gaussian(heatmap: np.ndarray, center: Tuple[int, int], sigma: float):
+    """
+    Vẽ gaussian 2D lên heatmap. center là (x, y) theo hệ tọa độ heatmap.
+    heatmap: (H, W)
+    """
+    H, W = heatmap.shape
+    x0, y0 = center
+    # lưới
+    xs = np.arange(0, W, 1, dtype=np.float32)
+    ys = np.arange(0, H, 1, dtype=np.float32)[:, None]
+    # gaussian
+    g = np.exp(-((xs - x0)**2 + (ys - y0)**2) / (2 * sigma * sigma))
+    heatmap[:] = np.maximum(heatmap, g)  # giữ max nếu nhiều đối tượng chồng lên
+
+def create_heatmaps(img_w: int, img_h: int, centers: List[Tuple[float,float,int]],
+                    heatmap_size: Tuple[int,int], num_classes: int, sigma: float):
+    """
+    centers: list of (x_pixel, y_pixel, class_idx) trên ảnh gốc (pixel coords).
+    Trả về heatmaps: numpy array shape (num_classes, Hh, Wh)
+    Lưu ý: class_idx bắt đầu từ 1..(num_classes-1); index 0 reserved cho background không cần
+    """
+    Hh, Wh = heatmap_size
+    heatmaps = np.zeros((num_classes, Hh, Wh), dtype=np.float32)
+    # tỉ lệ từ ảnh -> heatmap
+    scale_x = Wh / img_w
+    scale_y = Hh / img_h
+    for (x, y, cls) in centers:
+        if cls <= 0 or cls >= num_classes:
+            continue
+        hx = x * scale_x
+        hy = y * scale_y
+        # clamp
+        hx = min(max(hx, 0), Wh - 1)
+        hy = min(max(hy, 0), Hh - 1)
+        draw_gaussian(heatmaps[cls], (hx, hy), sigma)
+    return heatmaps  # shape (num_classes, Hh, Wh)
+
+# -----------------------
+# Dataset: giả định mỗi ảnh có file label JSON cùng tên
+# Label định dạng example (list of dict):
+# [{"x": 123, "y": 45, "class": 1}, {"x": 321, "y": 67, "class":2}]
+# -----------------------
+class FOMODataset(Dataset):
+    def __init__(self, images_dir: str, transform=None, input_size=INPUT_SIZE,
+                 heatmap_size=HEATMAP_SIZE, num_classes=NUM_CLASSES, sigma=GAUSSIAN_SIGMA):
+        self.transform = transform
+        self.input_size = input_size
+        self.heatmap_size = heatmap_size
+        self.num_classes = num_classes
+        self.sigma = sigma
+
+        # tìm tất cả ảnh .jpg/.png
+        self.img_paths = sorted(glob(os.path.join(images_dir, "*.jpg")) + glob(os.path.join(images_dir, "*.png")))
+        if len(self.img_paths) == 0:
+            raise RuntimeError("Không tìm thấy ảnh trong " + images_dir)
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        base, _ = os.path.splitext(img_path)
+        label_path = base + ".json"  # mong label cùng tên .json
+        img = Image.open(img_path).convert("RGB")
+        img_w, img_h = img.size
+
+        # đọc label nếu có
+        centers = []
+        if os.path.exists(label_path):
+            with open(label_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for obj in data:
+                    # kỳ vọng obj có keys x, y, class
+                    centers.append((float(obj["x"]), float(obj["y"]), int(obj["class"])))
+        # resize input image
+        if self.transform is not None:
+            img_t = self.transform(img)  # tensor CxHxW
+        else:
+            img_t = transforms.ToTensor()(img)
+            img_t = transforms.Resize(self.input_size)(img_t)  # careful: resizing tensor
+        # tạo heatmap target dựa trên tọa độ gốc
+        heatmaps = create_heatmaps(img_w, img_h, centers, self.heatmap_size, self.num_classes, self.sigma)
+        # normalized image already done by transform
+        return img_t, torch.from_numpy(heatmaps)  # (C,H,W), (num_classes,Hh,Wh)
+
+# -----------------------
+# MÔ HÌNH FOMO (backbone + head)
+# -----------------------
+class FOMOModel(nn.Module):
+    def __init__(self, num_classes: int, pretrained_backbone: bool = False):
+        super().__init__()
+        # Dùng MobileNetV2 làm backbone, lấy feature map cuối
+        mobilenet = models.mobilenet_v2(pretrained=pretrained_backbone)
+        # loại bỏ classifier
+        self.features = mobilenet.features  # trả về tensor [B, 1280, Hf, Wf] (tùy input)
+        # 1x1 conv để chuyển kênh -> num_classes
+        self.head = nn.Conv2d(in_channels=1280, out_channels=num_classes, kernel_size=1)
+        # optional: upsample nếu feature map quá nhỏ so với heatmap target
+        # ta sẽ dùng interpolation khi cần trong forward
+
+    def forward(self, x):
+        # x: [B, 3, H_in, W_in]; dự kiến H_in/W_in = INPUT_SIZE
+        feats = self.features(x)  # [B, C, Hf, Wf]
+        out = self.head(feats)    # [B, num_classes, Hf, Wf] => logits heatmap (chưa sigmoid)
+        return out
+
+# -----------------------
+# HÀM HỌC (train) + VALIDATE
+# -----------------------
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss = 0.0
+    criterion = nn.BCEWithLogitsLoss()  # tính trên heatmap logits
+    for imgs, heatmaps in tqdm(loader, desc="Train"):
+        imgs = imgs.to(device, dtype=torch.float32)
+        heatmaps = heatmaps.to(device, dtype=torch.float32)  # shape [B, C, Hh, Wh]
+        logits = model(imgs)  # shape [B, C, Hf, Wf]
+        # nếu kích thước logits != heatmaps, ta cần up/down sample logits
+        if logits.shape[2:] != heatmaps.shape[2:]:
+            logits_resized = F.interpolate(logits, size=heatmaps.shape[2:], mode='bilinear', align_corners=False)
+        else:
+            logits_resized = logits
+        loss = criterion(logits_resized, heatmaps)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * imgs.size(0)
+    return total_loss / len(loader.dataset)
+
+def validate(model, loader, device):
+    model.eval()
+    total_loss = 0.0
+    criterion = nn.BCEWithLogitsLoss()
+    with torch.no_grad():
+        for imgs, heatmaps in tqdm(loader, desc="Val"):
+            imgs = imgs.to(device, dtype=torch.float32)
+            heatmaps = heatmaps.to(device, dtype=torch.float32)
+            logits = model(imgs)
+            if logits.shape[2:] != heatmaps.shape[2:]:
+                logits_resized = F.interpolate(logits, size=heatmaps.shape[2:], mode='bilinear', align_corners=False)
+            else:
+                logits_resized = logits
+            loss = criterion(logits_resized, heatmaps)
+            total_loss += loss.item() * imgs.size(0)
+    return total_loss / len(loader.dataset)
+
+# -----------------------
+# INFERENCE: từ heatmap logits -> danh sách centroid
+# -----------------------
+def heatmap_to_centroids(heatmap: np.ndarray, threshold: float = 0.3, local_max_radius: int = 1):
+    """
+    heatmap: (H, W) values 0..1 (after sigmoid)
+    Trả về list of (x, y) coords in heatmap coordinate (x horizontal)
+    local_max_radius: tìm local maxima trong vùng (2*radius+1)^2
+    """
+    H, W = heatmap.shape
+    # threshold
+    mask = heatmap > threshold
+    centroids = []
+    # simple local maxima: tìm pixel mà là max trong ô kxk
+    pad = local_max_radius
+    padded = np.pad(heatmap, pad, mode='constant', constant_values=0)
+    for y in range(H):
+        for x in range(W):
+            if not mask[y, x]:
+                continue
+            y0, x0 = y + pad, x + pad
+            window = padded[y0-pad:y0+pad+1, x0-pad:x0+pad+1]
+            if padded[y0, x0] == window.max():
+                centroids.append((x, y, heatmap[y,x]))  # x,y trong coords heatmap
+    return centroids
+
+def infer_image(model, image_bgr: np.ndarray, device, input_size=INPUT_SIZE, heatmap_size=HEATMAP_SIZE, threshold=0.3):
+    """
+    image_bgr: ảnh OpenCV BGR
+    Trả lại: heatmaps_pred (num_classes,Hh,Wh), list_centroids (per class in original image pixel coords)
+    """
+    model.eval()
+    img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
+    preprocess = transforms.Compose([
+        transforms.Resize(input_size),
+        transforms.ToTensor(),  # -> [C,H,W], 0..1
+    ])
+    input_t = preprocess(img_pil).unsqueeze(0).to(device)  # [1,C,H,W]
+    with torch.no_grad():
+        logits = model(input_t)  # [1,C,Hf,Wf]
+        # upsample logits to heatmap_size
+        logits_up = F.interpolate(logits, size=heatmap_size, mode='bilinear', align_corners=False)
+        probs = torch.sigmoid(logits_up).cpu().numpy()[0]  # [C, Hh, Wh]
+    Hh, Wh = heatmap_size
+    h_img, w_img = image_bgr.shape[:2]
+    centroids_per_class = {}
+    for cls in range(1, probs.shape[0]):  # skip background class 0
+        hm = probs[cls]
+        cents = heatmap_to_centroids(hm, threshold=threshold)
+        # convert to image pixel coords
+        convert = []
+        for (x_h, y_h, score) in cents:
+            x_img = x_h * (w_img / Wh)
+            y_img = y_h * (h_img / Hh)
+            convert.append((x_img, y_img, score))
+        centroids_per_class[cls] = convert
+    return probs, centroids_per_class
+
+# -----------------------
+# MAIN: ví dụ train + infer
+# -----------------------
+def main_train(images_dir_train, images_dir_val=None):
+    # transforms: normalize giống ImageNet (MobileNet nền pretrained)
+    transform = transforms.Compose([
+        transforms.Resize(INPUT_SIZE),
+        transforms.ToTensor(),  # 0..1
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+    ])
+    train_ds = FOMODataset(images_dir_train, transform=transform)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+
+    val_loader = None
+    if images_dir_val:
+        val_ds = FOMODataset(images_dir_val, transform=transform)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+    model = FOMOModel(num_classes=NUM_CLASSES, pretrained_backbone=False).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+    best_val = 1e9
+    for epoch in range(1, EPOCHS + 1):
+        print(f"Epoch {epoch}/{EPOCHS}")
+        train_loss = train_one_epoch(model, train_loader, optimizer, DEVICE)
+        print(f" Train loss: {train_loss:.6f}")
+        if val_loader is not None:
+            val_loss = validate(model, val_loader, DEVICE)
+            print(f" Val loss: {val_loss:.6f}")
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save(model.state_dict(), MODEL_SAVE)
+                print(" Saved best model.")
+        else:
+            # không có validation -> lưu model định kỳ
+            torch.save(model.state_dict(), f"fomo_epoch{epoch}.pth")
+        scheduler.step()
+
+    print("Training done.")
+
+def main_infer(image_path, model_path=MODEL_SAVE):
+    # load
+    model = FOMOModel(num_classes=NUM_CLASSES, pretrained_backbone=False).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    img = cv2.imread(image_path)
+    probs, cents = infer_image(model, img, DEVICE, input_size=INPUT_SIZE, heatmap_size=HEATMAP_SIZE, threshold=0.3)
+    # hiển thị
+    vis = img.copy()
+    for cls, pts in cents.items():
+        for (x,y,score) in pts:
+            cv2.circle(vis, (int(x), int(y)), 5, (0,255,0), -1)
+            cv2.putText(vis, f"C{cls}:{score:.2f}", (int(x)+6, int(y)-6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+    cv2.imshow("FOMO Infer", vis)
+    # show heatmaps
+    import matplotlib.pyplot as plt
+    nc = probs.shape[0]
+    for i in range(1, nc):
+        plt.figure(figsize=(3,3))
+        plt.title(f"Class {i} heatmap")
+        plt.imshow(probs[i], cmap='jet')
+        plt.colorbar()
+    plt.show()
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+# -----------------------
+# Nếu chạy trực tiếp
+# -----------------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["train","infer"], required=True)
+    parser.add_argument("--train_dir", type=str, default="train_images")
+    parser.add_argument("--val_dir", type=str, default=None)
+    parser.add_argument("--image", type=str, default=None)
+    parser.add_argument("--model", type=str, default=MODEL_SAVE)
+    args = parser.parse_args()
+
+    if args.mode == "train":
+        main_train(args.train_dir, images_dir_val=args.val_dir)
+    else:
+        if args.image is None:
+            raise RuntimeError("Chạy inference cần --image PATH_TO_IMAGE")
+        main_infer(args.image, model_path=args.model)
